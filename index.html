@@ -1,0 +1,1153 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<title>Min Økonomi</title>
+<meta name="description" content="Personlig økonomi-tracker med budget, mål og forecast"/>
+<meta name="theme-color" content="#1C1C1A"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="Økonomi"/>
+<link rel="manifest" href="manifest.json"/>
+<link rel="apple-touch-icon" href="icon-192.png"/>
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png"/>
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png"/>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=Instrument+Serif&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;font-family:'DM Sans',system-ui,sans-serif;transition:background 0.2s}
+  input,select,button,textarea{font-family:'DM Sans',system-ui,sans-serif}
+  ::-webkit-scrollbar{width:6px;height:6px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:#bbb;border-radius:3px}
+  .fade-in{animation:fadeIn 0.18s ease}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const {useState,useEffect,useRef}=React;
+const SALARY_PAY_DAY=28;
+// Brugerens forbrugsmønster - generisk dansk-forbrug (kan justeres efter første måneds data):
+// Dag 1-10 = 65% af månedens forbrug, dag 11-20 = 18%, dag 21-31 = 17%
+function expectedSpentFraction(day){
+  if(day<=10)return (day/10)*0.65;
+  if(day<=20)return 0.65+((day-10)/10)*0.18;
+  return Math.min(1,0.83+((day-20)/11)*0.17);
+}
+
+const HIST_CAT_MONTH={};
+
+const INCOME_CATS=new Set(['Løn','Feriepenge','Udlæg refusion','Overskydende skat','MobilePay modtaget']);
+const NEUTRAL_CATS=new Set(['Opsparing','Fra opsparing','Refusion modtaget']);
+const INTERNAL_CATS=NEUTRAL_CATS; // backwards compatibility alias
+const ALL_CATS=['Løn','Feriepenge','Udlæg refusion','Overskydende skat','MobilePay modtaget',
+  'MobilePay sendt','Dagligvarer','Restauranter & café','Bar & natteliv','Shopping & tøj',
+  'Bolig & indretning','Frisør & pleje','Benzin / bil','Transport','Rejse & fly',
+  'Sport & fritid','Gaming','Streaming','Software abonnementer','Forsikring',
+  'Offentlige afgifter','Underholdning & events','Spil & betting','Opsparing','Fra opsparing','Refusion modtaget','Andet'];
+const EXP_CATS=ALL_CATS.filter(c=>!INCOME_CATS.has(c)&&!NEUTRAL_CATS.has(c));
+const INC_CATS_LIST=ALL_CATS.filter(c=>INCOME_CATS.has(c));
+const NEUTRAL_CATS_LIST=ALL_CATS.filter(c=>NEUTRAL_CATS.has(c));
+
+const KEYWORDS=[
+  [['netto','rema','føtex','foetex','meny','bilka','coop','superbrugsen','kvickly','lidl','sunds fdb'],'Dagligvarer'],
+  [['mcdonalds','burger','pizza','kebab','sushi','cafe','café','restaurant','bao','7-eleven'],'Restauranter & café'],
+  [['spotify','apple.com','netflix','disney','hbo','tv 2'],'Streaming'],
+  [['openai','chatgpt','claude','geoguessr','adobe','figma','notion'],'Software abonnementer'],
+  [['ok silkeborg','ok kvickly','ok galten','ok sunds','ok sb','q8','shell','circle k','uno-x'],'Benzin / bil'],
+  [['ryanair','sas','norwegian','airbnb','booking','momondo','expedia'],'Rejse & fly'],
+  [['lønoverf','løn '],'Løn'],
+  [['feriepenge'],'Feriepenge'],
+  [['overskydende skat'],'Overskydende skat'],
+  [['vinted','primark','zalando','asos','h&m'],'Shopping & tøj'],
+  [['jysk','ikea','imerco','silvan','bauhaus'],'Bolig & indretning'],
+  [['playstation','steam','kinguin','xbox','epic games'],'Gaming'],
+  [['rejsekort','dsb','easypark','taxi','uber','rejsebillet','parkering'],'Transport'],
+  [['bowling','padel','fodbold','tennis','squash','smukcrew'],'Sport & fritid'],
+  [['if skadeforsikring','tryg','topdanmark','alka','codan'],'Forsikring'],
+  [['the duke','pinds','bryghus','sportspubben','den engelske','zanders'],'Bar & natteliv'],
+  [['mobilepay'],'MobilePay sendt'],
+  [['safeticket','ticketmaster','livenation','byfest'],'Underholdning & events'],
+  [['bet365','danske spil'],'Spil & betting'],
+  [['waxies','prime cuts','barbershop','frisør','humble barber','gainerhair'],'Frisør & pleje'],
+];
+function autoCategory(desc){
+  const d=desc.toLowerCase();
+  for(const [kws,cat] of KEYWORDS){if(kws.some(k=>d.includes(k)))return cat;}
+  return null;
+}
+
+const fmt=n=>Math.abs(n).toLocaleString('da-DK',{maximumFractionDigits:0})+' kr';
+const fmtS=n=>(n>=0?'+':'-')+fmt(n);
+const ls={get:k=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}},
+          set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}}};
+const todayISO=()=>new Date().toISOString().slice(0,10);
+const monthOf=d=>d.slice(0,7);
+const daysBetween=(a,b)=>Math.floor((new Date(b)-new Date(a))/(1000*60*60*24));
+const danishDate=iso=>{const [y,m,d]=iso.split('-');return d+'/'+m+' '+y.slice(2);};
+const relTime=iso=>{
+  const d=daysBetween(iso,todayISO());
+  if(d<0)return 'om '+Math.abs(d)+' dage';
+  if(d===0)return 'i dag';
+  if(d===1)return 'i går';
+  if(d<7)return d+' dage siden';
+  if(d<30)return Math.floor(d/7)+' uger siden';
+  return Math.floor(d/30)+' md siden';
+};
+
+const THEMES={
+  light:{bg:'#F7F6F2',card:'#FFFFFF',text:'#1C1C1A',muted:'#75746F',border:'#E6E4DC',
+         green:'#1A7A48',red:'#C13A2C',amber:'#B45309',blue:'#1D6EA5',
+         gbg:'#EDF7F2',rbg:'#FDF0EF',abg:'#FEF4E7',bbg:'#EEF4FA',
+         headerBg:'#1C1C1A',headerMuted:'rgba(255,255,255,0.45)',inputBg:'#FFFFFF'},
+  dark:{bg:'#16161A',card:'#1F1F23',text:'#F0EFEA',muted:'#9C9B95',border:'#2D2D32',
+        green:'#34D399',red:'#F87171',amber:'#FBBF24',blue:'#60A5FA',
+        gbg:'#0F2620',rbg:'#2A1614',abg:'#2A1F0F',bbg:'#0E1F30',
+        headerBg:'#0A0A0C',headerMuted:'rgba(255,255,255,0.4)',inputBg:'#1F1F23'}
+};
+
+function MonthChart({data,C}){
+  const ref=useRef(null);
+  const chartRef=useRef(null);
+  useEffect(()=>{
+    if(!ref.current)return;
+    if(chartRef.current)chartRef.current.destroy();
+    chartRef.current=new Chart(ref.current,{
+      type:'bar',
+      data:{
+        labels:data.map(d=>d.label||d.id),
+        datasets:[
+          {label:'Indtægter',data:data.map(d=>d.income),backgroundColor:C.green,borderRadius:3,barPercentage:0.8,categoryPercentage:0.7},
+          {label:'Udgifter',data:data.map(d=>d.expense),backgroundColor:C.red,borderRadius:3,barPercentage:0.8,categoryPercentage:0.7},
+        ]
+      },
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},
+          tooltip:{backgroundColor:C.card,titleColor:C.text,bodyColor:C.text,borderColor:C.border,borderWidth:1,padding:10,
+            titleFont:{family:"'DM Sans'",size:12,weight:'600'},bodyFont:{family:"'DM Sans'",size:12},
+            callbacks:{label:ctx=>ctx.dataset.label+': '+fmt(ctx.parsed.y)}}},
+        scales:{x:{ticks:{font:{size:10,family:"'DM Sans'"},color:C.muted,autoSkip:false},grid:{display:false},border:{display:false}},
+                y:{ticks:{font:{size:10,family:"'DM Sans'"},color:C.muted,callback:v=>(v/1000).toFixed(0)+'k'},grid:{color:C.border},border:{display:false}}}
+      }
+    });
+    return()=>{if(chartRef.current)chartRef.current.destroy();};
+  },[data,C]);
+  return React.createElement('div',{style:{position:'relative',height:200,width:'100%'}},
+    React.createElement('canvas',{ref}));
+}
+
+function CategoryTrend({months,values,C}){
+  const ref=useRef(null);
+  const chartRef=useRef(null);
+  useEffect(()=>{
+    if(!ref.current)return;
+    if(chartRef.current)chartRef.current.destroy();
+    chartRef.current=new Chart(ref.current,{
+      type:'line',
+      data:{labels:months,datasets:[{data:values,borderColor:C.blue,backgroundColor:C.bbg,fill:true,tension:0.3,pointRadius:3,pointBackgroundColor:C.blue,borderWidth:2}]},
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},
+          tooltip:{backgroundColor:C.card,titleColor:C.text,bodyColor:C.text,borderColor:C.border,borderWidth:1,padding:8,
+            titleFont:{size:11},bodyFont:{size:12},callbacks:{label:ctx=>fmt(ctx.parsed.y)}}},
+        scales:{x:{ticks:{font:{size:10,family:"'DM Sans'"},color:C.muted},grid:{display:false},border:{display:false}},
+                y:{ticks:{font:{size:10,family:"'DM Sans'"},color:C.muted,callback:v=>(v/1000).toFixed(1)+'k'},grid:{color:C.border},border:{display:false}}}
+      }
+    });
+    return()=>{if(chartRef.current)chartRef.current.destroy();};
+  },[months,values,C]);
+  return React.createElement('div',{style:{position:'relative',height:140,width:'100%'}},
+    React.createElement('canvas',{ref}));
+}
+
+function App(){
+  const [tab,setTab]=useState('overblik');
+  const [bal,setBal]=useState(()=>ls.get('fin-bal')||{lon:0,ops:0});
+  const [txs,setTxs]=useState(()=>ls.get('fin-txs')||[]);
+  const [budgets,setBudgets]=useState(()=>ls.get('fin-budgets')||{});
+  const [goals,setGoals]=useState(()=>ls.get('fin-goals')||[]);
+  const [fixed,setFixed]=useState(()=>ls.get('fin-fixed')||[
+    {id:1,name:'IF Skadeforsikring',amount:285,cat:'Forsikring'},
+    {id:2,name:'Spotify',amount:119,cat:'Streaming'},
+    {id:3,name:'ChatGPT Plus',amount:173,cat:'Software abonnementer'},
+    {id:4,name:'Apple iCloud',amount:25,cat:'Streaming'},
+  ]);
+  const [templates,setTemplates]=useState(()=>ls.get('fin-templates')||[
+    {id:1,name:'Netto',amount:200,cat:'Dagligvarer',desc:'Netto dagligvarer'},
+    {id:2,name:'Tankning OK',amount:400,cat:'Benzin / bil',desc:'OK tankning'},
+    {id:3,name:'Frokost',amount:75,cat:'Restauranter & café',desc:'Frokost ude'},
+  ]);
+  const [dark,setDark]=useState(()=>ls.get('fin-dark')||false);
+  const [expectedSalary,setExpectedSalary]=useState(()=>{
+    const stored=ls.get('fin-salary');
+    if(stored)return stored;
+    // Default: 15.000 kr - juster i indstillinger
+    return 15000;
+  });
+  const [tmpSalary,setTmpSalary]=useState('');
+
+  const [editBal,setEditBal]=useState(false);
+  const [tmpLon,setTmpLon]=useState('');
+  const [tmpOps,setTmpOps]=useState('');
+  const [form,setForm]=useState({date:todayISO(),amount:'',desc:'',cat:'Dagligvarer',type:'expense',udlaeg:'',linkedCat:''});
+  const [saved,setSaved]=useState(false);
+  const [filterCat,setFilterCat]=useState('');
+  const [filterMonth,setFilterMonth]=useState('');
+  const [search,setSearch]=useState('');
+  const [trendCat,setTrendCat]=useState(null);
+  const [pasteText,setPasteText]=useState('');
+  const [importMsg,setImportMsg]=useState(null);
+  const [importPreview,setImportPreview]=useState(null);
+  const [newGoal,setNewGoal]=useState({name:'',target:''});
+  const [newFixed,setNewFixed]=useState({name:'',amount:'',cat:'Dagligvarer'});
+  const [newTemplate,setNewTemplate]=useState({name:'',amount:'',cat:'Dagligvarer',desc:''});
+
+  const C=dark?THEMES.dark:THEMES.light;
+
+  useEffect(()=>ls.set('fin-bal',bal),[bal]);
+  useEffect(()=>ls.set('fin-txs',txs),[txs]);
+  useEffect(()=>ls.set('fin-budgets',budgets),[budgets]);
+  useEffect(()=>ls.set('fin-goals',goals),[goals]);
+  useEffect(()=>ls.set('fin-fixed',fixed),[fixed]);
+  useEffect(()=>ls.set('fin-templates',templates),[templates]);
+  useEffect(()=>ls.set('fin-salary',expectedSalary),[expectedSalary]);
+  useEffect(()=>{ls.set('fin-dark',dark);document.body.style.background=C.bg;document.body.style.color=C.text;},[dark,C]);
+
+  useEffect(()=>{
+    if(form.desc.length>2 && form.type==='expense'){
+      const guess=autoCategory(form.desc);
+      if(guess&&!INCOME_CATS.has(guess)&&!NEUTRAL_CATS.has(guess)&&form.cat!==guess)setForm(f=>({...f,cat:guess}));
+    }
+  },[form.desc,form.type]);
+
+  function setFormType(type){
+    const newCat=type==='income'?INC_CATS_LIST[0]:type==='neutral'?NEUTRAL_CATS_LIST[0]:'Dagligvarer';
+    setForm(f=>({...f,type,cat:newCat,udlaeg:'',linkedCat:''}));
+  }
+
+  function saveBal(){
+    setBal({lon:parseFloat(tmpLon)||bal.lon,ops:parseFloat(tmpOps)||bal.ops});setEditBal(false);
+  }
+  // Anvend effekt af en transaktion på saldi (factor=1 for tilføj, -1 for fjern)
+  function applyBalDelta(tx,factor=1){
+    setBal(b=>{
+      let dlon=0,dops=0;
+      if(tx.cat==='Opsparing'){
+        // Flyt fra lønkonto til opsparing; amount er negativt
+        dlon=tx.amount*factor;
+        dops=-tx.amount*factor;
+      }else if(tx.cat==='Fra opsparing'){
+        // Flyt fra opsparing til lønkonto; amount er positivt
+        dlon=tx.amount*factor;
+        dops=-tx.amount*factor;
+      }else{
+        // Almindelig udgift, indtægt eller refusion: kun lønkonto
+        dlon=tx.amount*factor;
+      }
+      return{
+        lon:Math.round((b.lon+dlon)*100)/100,
+        ops:Math.round((b.ops+dops)*100)/100,
+      };
+    });
+  }
+  function submitForm(){
+    if(!form.date||!form.amount||!form.desc)return;
+    const raw=parseFloat(form.amount.replace(',','.'));
+    if(isNaN(raw))return;
+    const isInc=INCOME_CATS.has(form.cat);
+    const amount=isInc||form.cat==='Fra opsparing'?Math.abs(raw):-Math.abs(raw);
+    const udlaeg=form.type==='expense'&&form.udlaeg?Math.min(Math.abs(raw),Math.abs(parseFloat(form.udlaeg.replace(',','.'))||0)):0;
+    const tx={id:Date.now(),date:form.date,amount,desc:form.desc,cat:form.cat};
+    if(udlaeg>0)tx.udlaeg=udlaeg;
+    if(form.cat==='Refusion modtaget'&&form.linkedCat)tx.linkedCat=form.linkedCat;
+    setTxs([tx,...txs]);
+    applyBalDelta(tx,1);
+    setForm({...form,amount:'',desc:'',udlaeg:'',linkedCat:''});
+    setSaved(true);setTimeout(()=>setSaved(false),2200);
+  }
+  function applyTemplate(t){
+    const isInc=INCOME_CATS.has(t.cat);
+    const isNeu=NEUTRAL_CATS.has(t.cat);
+    const type=isInc?'income':isNeu?'neutral':'expense';
+    setForm({date:todayISO(),amount:t.amount.toString(),desc:t.desc,cat:t.cat,type,udlaeg:''});
+    setTab('tilføj');
+  }
+  function delTx(id){
+    const tx=txs.find(t=>t.id===id);
+    if(tx)applyBalDelta(tx,-1);
+    setTxs(txs.filter(t=>t.id!==id));
+  }
+  function triggerFixed(){
+    const today=todayISO();
+    const newTxs=fixed.map((f,i)=>({id:Date.now()+i,date:today,amount:-Math.abs(f.amount),desc:f.name,cat:f.cat}));
+    setTxs([...newTxs,...txs]);
+    newTxs.forEach(tx=>applyBalDelta(tx,1));
+    setSaved(true);setTimeout(()=>setSaved(false),2200);
+  }
+
+  function exportJSON(){
+    const data={bal,txs,budgets,goals,fixed,templates,exportDate:new Date().toISOString()};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='oekonomi-backup-'+todayISO()+'.json';a.click();
+    URL.revokeObjectURL(url);
+  }
+  function exportCSV(){
+    const rows=[['Dato','Beskrivelse','Kategori','Beløb']];
+    txs.forEach(t=>rows.push([t.date,t.desc,t.cat,t.amount.toString().replace('.',',')]));
+    const csv='\ufeff'+rows.map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(';')).join('\n');
+    const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='transaktioner-'+todayISO()+'.csv';a.click();
+    URL.revokeObjectURL(url);
+  }
+  function importJSON(e){
+    const f=e.target.files?.[0];if(!f)return;
+    const r=new FileReader();
+    r.onload=ev=>{
+      try{
+        const d=JSON.parse(ev.target.result);
+        if(d.bal)setBal(d.bal);
+        if(d.txs)setTxs(d.txs);
+        if(d.budgets)setBudgets(d.budgets);
+        if(d.goals)setGoals(d.goals);
+        if(d.fixed)setFixed(d.fixed);
+        if(d.templates)setTemplates(d.templates);
+        setImportMsg({ok:true,text:'Backup gendannet ✓'});
+        setTimeout(()=>setImportMsg(null),3000);
+      }catch{setImportMsg({ok:false,text:'Kunne ikke læse filen'});setTimeout(()=>setImportMsg(null),3000);}
+    };
+    r.readAsText(f);
+    e.target.value='';
+  }
+  function importCSVFile(e){
+    const f=e.target.files?.[0];if(!f)return;
+    const r=new FileReader();
+    r.onload=ev=>{
+      // Læs filen som tekst (UTF-8 med fallback til latin1 for ældre bank-eksporter)
+      let text=ev.target.result;
+      // Strip BOM hvis det er der
+      if(text.charCodeAt(0)===0xFEFF)text=text.slice(1);
+      setPasteText(text);
+      // Auto-trigger preview efter kort delay så state er opdateret
+      setTimeout(()=>{
+        if(text.trim()){
+          // Brug teksten direkte i stedet for at vente på state
+          parseImportText(text);
+        }
+      },50);
+    };
+    r.readAsText(f,'UTF-8');
+    e.target.value='';
+  }
+  function parseImport(){parseImportText(pasteText);}
+  function parseImportText(text){
+    if(!text||!text.trim())return;
+    const lines=text.trim().split('\n').filter(l=>l.trim());
+    // Detect & skip header line if present
+    const hasDateInFirstLine=/\d{4}[\/\-]\d{2}[\/\-]\d{2}/.test(lines[0]);
+    const dataLines=hasDateInFirstLine?lines:lines.slice(1);
+    const items=[];
+    let skipped=0;
+    dataLines.forEach((line,i)=>{
+      const parts=line.split(/[;\t]|,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(s=>s.trim().replace(/^"|"$/g,''));
+      if(parts.length<3){skipped++;return;}
+      let date=null,amount=null;
+      const textParts=[];
+      for(const p of parts){
+        if(!date&&/^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/.test(p))date=p.replace(/\//g,'-');
+        else if(amount===null&&/^-?\d{1,3}(\.\d{3})*([.,]\d+)?$/.test(p)&&p.length>0)amount=parseFloat(p.replace(/\./g,'').replace(',','.'));
+        else if(amount===null&&/^-?\d+([.,]\d+)?$/.test(p))amount=parseFloat(p.replace(',','.'));
+        else if(p&&p.length>1&&!/^\d+$/.test(p))textParts.push(p);
+      }
+      const desc=textParts.sort((a,b)=>b.length-a.length)[0]||'';
+      if(date&&amount!==null&&desc){
+        let guess=autoCategory(desc);
+        if(amount>0&&guess&&!INCOME_CATS.has(guess)&&!NEUTRAL_CATS.has(guess)){
+          guess=guess==='MobilePay sendt'?'MobilePay modtaget':null;
+        }
+        const cat=guess||(amount>0?'MobilePay modtaget':'Andet');
+        const isInc=INCOME_CATS.has(cat);
+        const isNeu=NEUTRAL_CATS.has(cat);
+        const type=isInc?'income':isNeu?'neutral':'expense';
+        // Tjek for dublet i eksisterende transaktioner (samme dato+beløb+beskrivelse)
+        const isDuplicate=txs.some(t=>
+          t.date===date&&
+          Math.abs(Math.abs(t.amount)-Math.abs(amount))<0.01&&
+          t.desc.trim().toLowerCase()===desc.trim().toLowerCase()
+        );
+        items.push({tmpId:Date.now()+i,date,amount,desc,cat,type,udlaeg:'',linkedCat:'',included:!isDuplicate,isDuplicate});
+      }else skipped++;
+    });
+    if(items.length>0){
+      setImportPreview({items,skipped});
+    }else{
+      setImportMsg({ok:false,text:'Ingen gyldige transaktioner fundet. Format: dato;beløb;beskrivelse'});
+      setTimeout(()=>setImportMsg(null),4000);
+    }
+  }
+  function updatePreviewItem(idx,changes){
+    setImportPreview(p=>({...p,items:p.items.map((it,i)=>i===idx?{...it,...changes}:it)}));
+  }
+  function setPreviewType(idx,type){
+    const it=importPreview.items[idx];
+    let newCat=it.cat;
+    if(type==='income'&&!INCOME_CATS.has(it.cat))newCat=it.amount>0?'MobilePay modtaget':INC_CATS_LIST[0];
+    if(type==='neutral'&&!NEUTRAL_CATS.has(it.cat))newCat='Refusion modtaget';
+    if(type==='expense'&&(INCOME_CATS.has(it.cat)||NEUTRAL_CATS.has(it.cat)))newCat=autoCategory(it.desc)||'Andet';
+    updatePreviewItem(idx,{type,cat:newCat,udlaeg:type==='expense'?it.udlaeg:''});
+  }
+  function bulkMarkIncomingAsRefusion(){
+    setImportPreview(p=>({...p,items:p.items.map(it=>
+      it.amount>0&&it.type==='income'?{...it,type:'neutral',cat:'Refusion modtaget'}:it)}));
+  }
+  function bulkToggleDuplicates(includeAll){
+    setImportPreview(p=>({...p,items:p.items.map(it=>
+      it.isDuplicate?{...it,included:includeAll}:it)}));
+  }
+  function confirmImport(){
+    if(!importPreview)return;
+    const newTxs=importPreview.items.filter(it=>it.included).map(it=>{
+      let amt=it.amount;
+      if(it.type==='income'||it.cat==='Fra opsparing')amt=Math.abs(amt);
+      else if(it.type==='expense')amt=-Math.abs(amt);
+      const tx={id:it.tmpId,date:it.date,amount:amt,desc:it.desc,cat:it.cat};
+      if(it.type==='expense'&&it.udlaeg){
+        const u=Math.abs(parseFloat(it.udlaeg.toString().replace(',','.'))||0);
+        if(u>0)tx.udlaeg=Math.min(Math.abs(amt),u);
+      }
+      if(it.cat==='Refusion modtaget'&&it.linkedCat)tx.linkedCat=it.linkedCat;
+      return tx;
+    });
+    setTxs([...newTxs,...txs]);
+    newTxs.forEach(tx=>applyBalDelta(tx,1));
+    setImportPreview(null);
+    setPasteText('');
+    setImportMsg({ok:true,text:newTxs.length+' transaktioner importeret · saldi opdateret'});
+    setTimeout(()=>setImportMsg(null),3000);
+  }
+  function cancelImport(){
+    setImportPreview(null);
+  }
+  function resetAll(){
+    if(!confirm('Sikker? Dette sletter alle dine indtastede data.'))return;
+    ['fin-bal','fin-txs','fin-budgets','fin-goals','fin-fixed','fin-templates','fin-dark'].forEach(k=>localStorage.removeItem(k));
+    location.reload();
+  }
+
+  // Aggregates - reelle udgifter = beløb minus udlæg minus refusioner modtaget
+  const newInc=txs.filter(t=>INCOME_CATS.has(t.cat)).reduce((s,t)=>s+t.amount,0);
+  const newGrossExp=txs.filter(t=>!INCOME_CATS.has(t.cat)&&!NEUTRAL_CATS.has(t.cat)).reduce((s,t)=>s+(Math.abs(t.amount)-(t.udlaeg||0)),0);
+  const newRefusion=txs.filter(t=>t.cat==='Refusion modtaget').reduce((s,t)=>s+Math.abs(t.amount),0);
+  const newExp=newGrossExp-newRefusion;
+  const newUdlaeg=txs.reduce((s,t)=>s+(t.udlaeg||0),0);
+  const totalInc=newInc;
+  const totalExp=newExp;
+  const totalFormue=bal.lon+bal.ops;
+
+  const mMap={};
+  txs.forEach(tx=>{
+    const mid=monthOf(tx.date);
+    if(!mMap[mid]){
+      const [y,mo]=mid.split('-');
+      mMap[mid]={id:mid,label:['Jan','Feb','Mar','Apr','Maj','Jun','Jul','Aug','Sep','Okt','Nov','Dec'][parseInt(mo)-1]+' '+y.slice(2),income:0,expense:0};
+    }
+    if(INCOME_CATS.has(tx.cat))mMap[mid].income+=tx.amount;
+    else if(tx.cat==='Refusion modtaget')mMap[mid].expense-=Math.abs(tx.amount);
+    else if(!NEUTRAL_CATS.has(tx.cat))mMap[mid].expense+=(Math.abs(tx.amount)-(tx.udlaeg||0));
+  });
+  const mData=Object.values(mMap).sort((a,b)=>a.id.localeCompare(b.id));
+  const numMonths=Object.keys(mMap).length||1;
+  const avgExp=totalExp/numMonths;
+
+  const cMap={};
+  Object.entries(HIST_CAT_MONTH).forEach(([cat,months])=>{
+    cMap[cat]=Object.values(months).reduce((s,v)=>s+v,0);
+  });
+  txs.filter(t=>!INCOME_CATS.has(t.cat)&&!NEUTRAL_CATS.has(t.cat)).forEach(tx=>{
+    cMap[tx.cat]=(cMap[tx.cat]||0)+(Math.abs(tx.amount)-(tx.udlaeg||0));
+  });
+  // Refusioner reducerer kategorien de er knyttet til
+  txs.filter(t=>t.cat==='Refusion modtaget'&&t.linkedCat).forEach(tx=>{
+    cMap[tx.linkedCat]=Math.max(0,(cMap[tx.linkedCat]||0)-Math.abs(tx.amount));
+  });
+  const cData=Object.entries(cMap).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
+  const maxCat=cData[0]?.[1]||1;
+
+  const iMap={};
+  txs.filter(t=>INCOME_CATS.has(t.cat)).forEach(tx=>{iMap[tx.cat]=(iMap[tx.cat]||0)+tx.amount;});
+  const iData=Object.entries(iMap).sort((a,b)=>b[1]-a[1]);
+  const maxInc=iData[0]?.[1]||1;
+
+  const lastTxDate=txs.length>0?txs.map(t=>t.date).sort().pop():null;
+  const overallLast=lastTxDate;
+
+  const today=todayISO();
+  const curMonth=monthOf(today);
+  const curMonthData=mData.find(m=>m.id===curMonth);
+  const lastMonthIdx=mData.findIndex(m=>m.id===curMonth);
+  const prevMonth=lastMonthIdx>0?mData[lastMonthIdx-1]:null;
+  const monthChange=prevMonth&&curMonthData&&prevMonth.expense>0?((curMonthData.expense-prevMonth.expense)/prevMonth.expense*100):null;
+  
+  const curMonthHistExp=Object.values(HIST_CAT_MONTH).reduce((s,m)=>s+(m[curMonth]||0),0);
+  const curMonthGrossExp=txs.filter(t=>monthOf(t.date)===curMonth&&!INCOME_CATS.has(t.cat)&&!NEUTRAL_CATS.has(t.cat)).reduce((s,t)=>s+(Math.abs(t.amount)-(t.udlaeg||0)),0);
+  const curMonthRefusion=txs.filter(t=>monthOf(t.date)===curMonth&&t.cat==='Refusion modtaget').reduce((s,t)=>s+Math.abs(t.amount),0);
+  const curMonthNewExp=curMonthGrossExp-curMonthRefusion;
+  const curMonthSpent=curMonthHistExp+curMonthNewExp;
+  const dayOfMonth=new Date(today).getDate();
+  const daysInMonth=new Date(new Date(today).getFullYear(),new Date(today).getMonth()+1,0).getDate();
+  
+  // Non-linear udgiftsprognose baseret på dit faktiske forbrugsmønster
+  // Dag 1-10 = 65%, dag 11-20 = 18%, dag 21-31 = 17% af månedens forbrug
+  const fractionSpent=expectedSpentFraction(dayOfMonth);
+  const recentMonths=mData.filter(m=>m.id<curMonth).slice(-3);
+  const recentExpAvg=recentMonths.length?recentMonths.reduce((s,m)=>s+m.expense,0)/recentMonths.length:10000;
+  const projectedFromCurrent=fractionSpent>0.05?curMonthSpent/fractionSpent:recentExpAvg;
+  // Vægtet: lyt mere til faktisk forbrug jo længere ind i måneden vi er
+  const forecast=Math.round(projectedFromCurrent*fractionSpent+recentExpAvg*(1-fractionSpent));
+  const remainingExpense=Math.max(0,forecast-curMonthSpent);
+  
+  // Indtægtsprognose: tjek om løn allerede er modtaget denne måned
+  const curMonthLonNew=txs.filter(t=>t.cat==='Løn'&&monthOf(t.date)===curMonth).reduce((s,t)=>s+t.amount,0);
+  const salaryReceived=curMonthLonNew;
+  const salaryExpected=salaryReceived>1000?0:expectedSalary;
+  const curMonthIncSoFar=(curMonthData?.income||0);
+  const forecastIncome=curMonthIncSoFar+salaryExpected;
+  const forecastNetto=forecastIncome-forecast;
+
+  const merchantCount={};
+  txs.filter(t=>monthOf(t.date)===curMonth).forEach(t=>{
+    merchantCount[t.desc]=(merchantCount[t.desc]||0)+1;
+  });
+  const topMerchant=Object.entries(merchantCount).sort((a,b)=>b[1]-a[1])[0];
+
+  const bigExpenses=txs.filter(t=>!INCOME_CATS.has(t.cat)&&!NEUTRAL_CATS.has(t.cat)&&(Math.abs(t.amount)-(t.udlaeg||0))>500&&t.cat!=='MobilePay sendt').sort((a,b)=>b.date.localeCompare(a.date));
+  const daysSinceBig=bigExpenses[0]?daysBetween(bigExpenses[0].date,today):null;
+
+  const filtered=txs.filter(t=>{
+    if(filterCat&&t.cat!==filterCat)return false;
+    if(filterMonth&&!t.date.startsWith(filterMonth))return false;
+    if(search&&!t.desc.toLowerCase().includes(search.toLowerCase())&&!t.cat.toLowerCase().includes(search.toLowerCase()))return false;
+    return true;
+  });
+
+  const allMonthIds=[...new Set(txs.map(t=>monthOf(t.date)))].sort();
+  const allCatsUsed=[...new Set(txs.map(t=>t.cat))].sort();
+
+  const curMonthCatSpend={};
+  Object.entries(HIST_CAT_MONTH).forEach(([cat,months])=>{
+    curMonthCatSpend[cat]=months[curMonth]||0;
+  });
+  txs.filter(t=>monthOf(t.date)===curMonth&&!INCOME_CATS.has(t.cat)&&!NEUTRAL_CATS.has(t.cat)).forEach(t=>{
+    curMonthCatSpend[t.cat]=(curMonthCatSpend[t.cat]||0)+(Math.abs(t.amount)-(t.udlaeg||0));
+  });
+  txs.filter(t=>monthOf(t.date)===curMonth&&t.cat==='Refusion modtaget'&&t.linkedCat).forEach(t=>{
+    curMonthCatSpend[t.linkedCat]=Math.max(0,(curMonthCatSpend[t.linkedCat]||0)-Math.abs(t.amount));
+  });
+
+  const card={background:C.card,border:'1px solid '+C.border,borderRadius:12,padding:'1rem 1.25rem',marginBottom:12};
+  const secTitle={fontSize:11,fontWeight:600,color:C.muted,textTransform:'uppercase',letterSpacing:'0.07em',marginBottom:12};
+  const barBg={flex:1,height:7,background:C.bg,borderRadius:4,overflow:'hidden'};
+  const inp={width:'100%',padding:'9px 11px',border:'1px solid '+C.border,borderRadius:8,fontSize:14,color:C.text,background:C.inputBg,outline:'none'};
+  const inpLabel={fontSize:12,fontWeight:500,color:C.muted,marginBottom:5,display:'block'};
+  const btnPrim={padding:'10px 16px',borderRadius:8,background:C.text,color:C.card,border:'none',cursor:'pointer',fontSize:13,fontWeight:600};
+  const btnSec={padding:'7px 12px',borderRadius:7,background:'transparent',color:C.muted,border:'1px solid '+C.border,cursor:'pointer',fontSize:12};
+
+  const navs=[
+    {id:'overblik',label:'Overblik'},
+    {id:'måneder',label:'Måneder'},
+    {id:'kategorier',label:'Kategorier'},
+    {id:'budget',label:'Budget'},
+    {id:'mål',label:'Mål'},
+    {id:'transaktioner',label:'Trans.'+(txs.length>0?' ('+txs.length+')':'')},
+    {id:'tilføj',label:'+ Tilføj'},
+    {id:'indstillinger',label:'⚙'},
+  ];
+
+  const catHint=INCOME_CATS.has(form.cat)
+    ?{text:'↑ Tæller som indtægt',c:C.green,bg:C.gbg}
+    :form.cat==='Refusion modtaget'
+    ?{text:'↔ Reducerer udgifter '+(form.linkedCat?'i kategori "'+form.linkedCat+'"':'i alt'),c:C.amber,bg:C.abg}
+    :form.cat==='Fra opsparing'
+    ?{text:'↔ Overførsel fra opsparing til lønkonto',c:C.amber,bg:C.abg}
+    :form.cat==='Opsparing'
+    ?{text:'↔ Overførsel til opsparing (intern, tæller ikke som forbrug)',c:C.amber,bg:C.abg}
+    :{text:'↓ Tæller som udgift',c:C.red,bg:C.rbg};
+
+  return React.createElement('div',{style:{minHeight:'100vh',background:C.bg,color:C.text}},
+    React.createElement('div',{style:{background:C.card,borderBottom:'1px solid '+C.border,position:'sticky',top:0,zIndex:100}},
+      React.createElement('div',{style:{maxWidth:860,margin:'0 auto',padding:'0 1.5rem'}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',paddingTop:'0.9rem',paddingBottom:'0.5rem'}},
+          React.createElement('span',{style:{fontFamily:"'Instrument Serif',serif",fontSize:22,color:C.text}},'Min Økonomi'),
+          React.createElement('div',{style:{display:'flex',gap:8,alignItems:'center'}},
+            React.createElement('button',{onClick:()=>setDark(!dark),title:dark?'Lys':'Mørk',
+              style:{background:'transparent',border:'1px solid '+C.border,borderRadius:7,width:32,height:32,cursor:'pointer',color:C.muted,fontSize:14}},dark?'☀':'☾'),
+            overallLast && React.createElement('span',{style:{fontSize:11,color:C.muted,background:C.bg,padding:'3px 9px',borderRadius:20,border:'1px solid '+C.border}},'Sidst: '+danishDate(overallLast))
+          )
+        ),
+        React.createElement('div',{style:{display:'flex',gap:0,overflowX:'auto'}},
+          navs.map(n=>React.createElement('button',{key:n.id,onClick:()=>setTab(n.id),style:{
+            padding:'7px 14px',fontSize:13,border:'none',background:'transparent',cursor:'pointer',whiteSpace:'nowrap',
+            color:tab===n.id?C.text:C.muted,fontWeight:tab===n.id?600:400,
+            borderBottom:tab===n.id?'2px solid '+C.text:'2px solid transparent'
+          }},n.label))
+        )
+      )
+    ),
+
+    React.createElement('div',{style:{maxWidth:860,margin:'0 auto',padding:'1.25rem 1.5rem'}},
+
+      React.createElement('div',{style:{background:C.headerBg,borderRadius:12,padding:'1rem 1.25rem',marginBottom:14}},
+        editBal
+          ? React.createElement('div',null,
+              React.createElement('div',{style:{fontSize:11,color:C.headerMuted,marginBottom:10,textTransform:'uppercase',letterSpacing:'0.06em'}},'Opdater saldi'),
+              React.createElement('div',{style:{display:'flex',gap:10,flexWrap:'wrap',alignItems:'flex-end'}},
+                React.createElement('div',null,
+                  React.createElement('div',{style:{fontSize:11,color:C.headerMuted,marginBottom:3}},'Lønkonto'),
+                  React.createElement('input',{value:tmpLon,onChange:e=>setTmpLon(e.target.value),placeholder:bal.lon.toLocaleString('da-DK'),
+                    style:{...inp,background:'rgba(255,255,255,0.08)',border:'1px solid rgba(255,255,255,0.15)',color:'#fff',width:140}})),
+                React.createElement('div',null,
+                  React.createElement('div',{style:{fontSize:11,color:C.headerMuted,marginBottom:3}},'Opsparing'),
+                  React.createElement('input',{value:tmpOps,onChange:e=>setTmpOps(e.target.value),placeholder:bal.ops.toLocaleString('da-DK'),
+                    style:{...inp,background:'rgba(255,255,255,0.08)',border:'1px solid rgba(255,255,255,0.15)',color:'#fff',width:140}})),
+                React.createElement('button',{onClick:saveBal,style:{padding:'9px 16px',borderRadius:8,background:'#fff',color:'#1C1C1A',border:'none',cursor:'pointer',fontSize:13,fontWeight:600}},'Gem'),
+                React.createElement('button',{onClick:()=>setEditBal(false),style:{padding:'9px 14px',borderRadius:8,background:'transparent',color:C.headerMuted,border:'1px solid rgba(255,255,255,0.15)',cursor:'pointer',fontSize:13}},'Annuller')
+              ))
+          : React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:12}},
+              React.createElement('div',{style:{display:'flex',gap:22,flexWrap:'wrap',alignItems:'center'}},
+                React.createElement('div',null,
+                  React.createElement('div',{style:{fontSize:10,color:C.headerMuted,marginBottom:2,textTransform:'uppercase',letterSpacing:'0.06em'}},'Lønkonto'),
+                  React.createElement('div',{style:{fontSize:18,fontWeight:600,color:'#fff'}},fmt(bal.lon))),
+                React.createElement('div',{style:{width:1,height:30,background:'rgba(255,255,255,0.12)'}}),
+                React.createElement('div',null,
+                  React.createElement('div',{style:{fontSize:10,color:C.headerMuted,marginBottom:2,textTransform:'uppercase',letterSpacing:'0.06em'}},'Opsparing'),
+                  React.createElement('div',{style:{fontSize:18,fontWeight:600,color:'#fff'}},fmt(bal.ops))),
+                React.createElement('div',{style:{width:1,height:30,background:'rgba(255,255,255,0.12)'}}),
+                React.createElement('div',null,
+                  React.createElement('div',{style:{fontSize:10,color:C.headerMuted,marginBottom:2,textTransform:'uppercase',letterSpacing:'0.06em'}},'Samlet formue'),
+                  React.createElement('div',{style:{fontSize:18,fontWeight:600,color:'#6EE7B7'}},fmt(totalFormue)))
+              ),
+              React.createElement('button',{onClick:()=>{setTmpLon(bal.lon.toString());setTmpOps(bal.ops.toString());setEditBal(true)},
+                title:'Saldoen opdateres automatisk når du tilføjer transaktioner — klik for manuel justering',
+                style:{padding:'7px 13px',borderRadius:8,background:'rgba(255,255,255,0.08)',color:C.headerMuted,border:'1px solid rgba(255,255,255,0.14)',cursor:'pointer',fontSize:12}},'✏ Juster')
+            )),
+
+      tab==='overblik' && React.createElement('div',{className:'fade-in'},
+        txs.length===0 && React.createElement('div',{style:{...card,background:C.bbg,borderColor:C.blue}},
+          React.createElement('div',{style:{fontSize:14,fontWeight:600,color:C.blue,marginBottom:6}},'👋 Velkommen til Min Økonomi'),
+          React.createElement('div',{style:{fontSize:12,color:C.text,lineHeight:1.6}},
+            'Kom i gang med ét af følgende:',
+            React.createElement('ul',{style:{margin:'6px 0 0 18px',padding:0}},
+              React.createElement('li',null,React.createElement('b',null,'Importer dit bank-CSV'),' under ⚙ Indstillinger → "Vælg CSV-fil" — så får du al historik på én gang'),
+              React.createElement('li',null,React.createElement('b',null,'Tilføj manuelt'),' via "+ Tilføj" fanen'),
+              React.createElement('li',null,React.createElement('b',null,'Sæt din nuværende saldo'),' via "✏ Juster" knappen ovenfor'))
+          )
+        ),
+        React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(130px,1fr))',gap:10,marginBottom:14}},
+          [{label:'Reelle indtægter',val:fmt(totalInc),c:C.green,bg:C.gbg},
+           {label:'Reelle udgifter',val:fmt(totalExp),c:C.red,bg:C.rbg},
+           {label:'Netto til opsparing',val:fmt(txs.filter(t=>t.cat==='Opsparing').reduce((s,t)=>s+Math.abs(t.amount),0)-txs.filter(t=>t.cat==='Fra opsparing').reduce((s,t)=>s+Math.abs(t.amount),0)),c:C.amber,bg:C.abg},
+           {label:'Gns. mdr. forbrug',val:fmt(avgExp),c:C.blue,bg:C.bbg}
+          ].map((m,i)=>React.createElement('div',{key:i,style:{background:m.bg,borderRadius:10,padding:'0.85rem 1rem'}},
+            React.createElement('div',{style:{fontSize:11,fontWeight:500,color:m.c,opacity:0.85,marginBottom:4}},m.label),
+            React.createElement('div',{style:{fontSize:19,fontWeight:600,color:m.c}},m.val)))
+        ),
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:14,flexWrap:'wrap',gap:8}},
+            React.createElement('div',null,
+              React.createElement('div',{style:secTitle},'Prognose for resten af '+(['januar','februar','marts','april','maj','juni','juli','august','september','oktober','november','december'][parseInt(curMonth.slice(5,7))-1]||'')),
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginTop:-8,marginBottom:0}},
+                'Baseret på dit forbrugsmønster (~65% af udgifterne dag 1-10) + forventet løn')),
+            monthChange!==null && React.createElement('div',{style:{textAlign:'right'}},
+              React.createElement('div',{style:{fontSize:10,color:C.muted,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:2}},'Vs. forrige md'),
+              React.createElement('div',{style:{fontSize:14,fontWeight:600,color:monthChange>0?C.red:C.green}},
+                (monthChange>0?'+':'')+monthChange.toFixed(0)+'%'))
+          ),
+          React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:10,marginBottom:14}},
+            React.createElement('div',{style:{padding:'10px 12px',background:C.gbg,borderRadius:8}},
+              React.createElement('div',{style:{fontSize:10,color:C.green,opacity:0.85,marginBottom:3,fontWeight:500}},'FORVENTET INDTÆGT'),
+              React.createElement('div',{style:{fontSize:17,fontWeight:600,color:C.green}},fmt(forecastIncome)),
+              React.createElement('div',{style:{fontSize:10,color:C.muted,marginTop:3}},
+                salaryExpected>0?'inkl. løn ~'+fmt(salaryExpected)+' (omkr. '+SALARY_PAY_DAY+'/'+(curMonth.slice(5,7))+')':'løn modtaget ✓')
+            ),
+            React.createElement('div',{style:{padding:'10px 12px',background:C.rbg,borderRadius:8}},
+              React.createElement('div',{style:{fontSize:10,color:C.red,opacity:0.85,marginBottom:3,fontWeight:500}},'FORVENTET UDGIFT'),
+              React.createElement('div',{style:{fontSize:17,fontWeight:600,color:C.red}},fmt(forecast)),
+              React.createElement('div',{style:{fontSize:10,color:C.muted,marginTop:3}},'~'+fmt(remainingExpense)+' tilbage')
+            ),
+            React.createElement('div',{style:{padding:'10px 12px',background:forecastNetto>=0?C.bbg:C.abg,borderRadius:8}},
+              React.createElement('div',{style:{fontSize:10,color:forecastNetto>=0?C.blue:C.amber,opacity:0.85,marginBottom:3,fontWeight:500}},'FORVENTET NETTO'),
+              React.createElement('div',{style:{fontSize:17,fontWeight:600,color:forecastNetto>=0?C.blue:C.amber}},(forecastNetto>=0?'+':'')+fmt(forecastNetto)),
+              React.createElement('div',{style:{fontSize:10,color:C.muted,marginTop:3}},forecastNetto>=0?'kan opspares':'underskud')
+            )
+          ),
+          React.createElement('div',{style:{padding:'9px 12px',background:C.bg,borderRadius:8,fontSize:12,color:C.muted}},
+            '📊 Du har brugt ',React.createElement('b',{style:{color:C.text,fontWeight:600}},fmt(curMonthSpent)),
+            ' indtil videre (dag ',dayOfMonth,'/',daysInMonth,'). Typisk har du brugt ',
+            React.createElement('b',{style:{color:C.text,fontWeight:600}},Math.round(fractionSpent*100)+'%'),
+            ' af månedens forbrug på dette tidspunkt.')
+        ),
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'Sjove statistikker'),
+          React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(180px,1fr))',gap:14}},
+            topMerchant && React.createElement('div',{key:'m'},
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginBottom:4}},'🏆 Mest besøgte denne måned'),
+              React.createElement('div',{style:{fontSize:14,fontWeight:600}},topMerchant[0]),
+              React.createElement('div',{style:{fontSize:11,color:C.muted}},topMerchant[1]+' gange')),
+            daysSinceBig!==null && React.createElement('div',{key:'b'},
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginBottom:4}},'🔥 Dage uden stort køb'),
+              React.createElement('div',{style:{fontSize:14,fontWeight:600,color:C.green}},daysSinceBig+' dage'),
+              React.createElement('div',{style:{fontSize:11,color:C.muted}},'(over 500 kr)')),
+            React.createElement('div',{key:'a'},
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginBottom:4}},'💰 Opsparing dækker'),
+              React.createElement('div',{style:{fontSize:14,fontWeight:600,color:C.amber}},(bal.ops/avgExp).toFixed(1)+' måneder'),
+              React.createElement('div',{style:{fontSize:11,color:C.muted}},'af gns. forbrug'))
+          )
+        ),
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'Månedlig oversigt'),
+          React.createElement(MonthChart,{data:mData,C}),
+          React.createElement('div',{style:{display:'flex',gap:14,marginTop:8,fontSize:12,color:C.muted}},
+            React.createElement('span',{style:{display:'flex',alignItems:'center',gap:5}},React.createElement('span',{style:{width:10,height:10,borderRadius:2,background:C.green,display:'inline-block'}}),'Indtægter'),
+            React.createElement('span',{style:{display:'flex',alignItems:'center',gap:5}},React.createElement('span',{style:{width:10,height:10,borderRadius:2,background:C.red,display:'inline-block'}}),'Udgifter'))
+        ),
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'Top 7 udgiftskategorier (klik for trend)'),
+          cData.slice(0,7).map(([name,val],i)=>React.createElement('div',{key:i,onClick:()=>{setTrendCat(name);setTab('kategorier');},
+            style:{display:'flex',alignItems:'center',gap:10,marginBottom:9,fontSize:13,cursor:'pointer'}},
+            React.createElement('div',{style:{width:170,flexShrink:0,color:C.muted,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},name),
+            React.createElement('div',{style:barBg},React.createElement('div',{style:{width:(val/maxCat*100)+'%',height:'100%',background:C.blue,borderRadius:4}})),
+            React.createElement('div',{style:{width:80,textAlign:'right',fontWeight:500}},fmt(val))))
+        )
+      ),
+
+      tab==='måneder' && React.createElement('div',{className:'fade-in'},
+        mData.map((m,i)=>{
+          const netto=m.income-m.expense;
+          const rate=m.income>0?Math.round(m.expense/m.income*100):100;
+          const prev=i>0?mData[i-1]:null;
+          const change=prev&&prev.expense>0?((m.expense-prev.expense)/prev.expense*100):null;
+          return React.createElement('div',{key:i,style:{...card}},
+            React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}},
+              React.createElement('div',null,
+                React.createElement('div',{style:{fontWeight:600,fontSize:15,marginBottom:2}},m.label||m.id),
+                React.createElement('div',{style:{fontSize:12,color:C.muted}},
+                  'Forbrugsrate: '+rate+'%'+(change!==null?' · '+(change>0?'+':'')+change.toFixed(0)+'% vs. forrige':''))),
+              React.createElement('div',{style:{textAlign:'right'}},
+                React.createElement('div',{style:{fontSize:15,fontWeight:600,color:netto>=0?C.green:C.red}},fmtS(netto)),
+                React.createElement('div',{style:{fontSize:11,color:C.muted,marginTop:2}},'netto'))),
+            React.createElement('div',{style:{display:'flex',gap:20,fontSize:13,color:C.muted,marginBottom:10}},
+              React.createElement('span',null,'↑ ',React.createElement('span',{style:{color:C.green,fontWeight:500}},fmt(m.income))),
+              React.createElement('span',null,'↓ ',React.createElement('span',{style:{color:C.red,fontWeight:500}},fmt(m.expense)))),
+            React.createElement('div',{style:{height:6,borderRadius:3,background:C.bg,overflow:'hidden'}},
+              React.createElement('div',{style:{width:Math.min(100,m.income>0?m.expense/m.income*100:100)+'%',height:'100%',background:m.expense>m.income?C.red:C.green,borderRadius:3}}))
+          );
+        })
+      ),
+
+      tab==='kategorier' && React.createElement('div',{className:'fade-in'},
+        trendCat && (function(){
+          const monthIds=mData.map(m=>m.id);
+          const values=monthIds.map(mid=>{
+            const hist=HIST_CAT_MONTH[trendCat]?.[mid]||0;
+            const newAdds=txs.filter(t=>t.cat===trendCat&&monthOf(t.date)===mid).reduce((s,t)=>s+Math.abs(t.amount),0);
+            return hist+newAdds;
+          });
+          return React.createElement('div',{style:{...card}},
+            React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}},
+              React.createElement('div',null,
+                React.createElement('div',{style:{fontSize:11,fontWeight:600,color:C.muted,textTransform:'uppercase',letterSpacing:'0.07em',marginBottom:4}},'Trend'),
+                React.createElement('div',{style:{fontSize:16,fontWeight:600}},trendCat)),
+              React.createElement('button',{onClick:()=>setTrendCat(null),style:btnSec},'Luk ✕')),
+            React.createElement(CategoryTrend,{months:mData.map(m=>m.label||m.id),values,C}),
+            React.createElement('div',{style:{display:'flex',gap:16,marginTop:10,fontSize:12,color:C.muted,flexWrap:'wrap'}},
+              React.createElement('span',null,'Total: ',React.createElement('span',{style:{fontWeight:600,color:C.text}},fmt(values.reduce((s,v)=>s+v,0)))),
+              React.createElement('span',null,'Gns/md: ',React.createElement('span',{style:{fontWeight:600,color:C.text}},fmt(values.reduce((s,v)=>s+v,0)/values.length))),
+              React.createElement('span',null,'Højest: ',React.createElement('span',{style:{fontWeight:600,color:C.text}},fmt(Math.max(...values))))));
+        })(),
+        React.createElement('div',{style:{...card,marginBottom:14}},
+          React.createElement('div',{style:secTitle},'Udgifter per kategori (klik for trend)'),
+          cData.map(([name,val],i)=>React.createElement('div',{key:i,onClick:()=>setTrendCat(name),
+            style:{display:'flex',alignItems:'center',gap:10,marginBottom:9,fontSize:13,cursor:'pointer',padding:'4px 0',background:trendCat===name?C.bbg:'transparent',borderRadius:6,paddingLeft:trendCat===name?8:0,paddingRight:trendCat===name?8:0}},
+            React.createElement('div',{style:{width:180,flexShrink:0,color:C.muted,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},name),
+            React.createElement('div',{style:barBg},React.createElement('div',{style:{width:(val/maxCat*100)+'%',height:'100%',background:trendCat===name?C.blue:C.muted,borderRadius:4}})),
+            React.createElement('div',{style:{width:80,textAlign:'right',fontWeight:500}},fmt(val))))
+        ),
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'Indtægtskilder'),
+          iData.map(([name,val],i)=>React.createElement('div',{key:i,style:{display:'flex',alignItems:'center',gap:10,marginBottom:9,fontSize:13}},
+            React.createElement('div',{style:{width:180,flexShrink:0,color:C.muted,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},name),
+            React.createElement('div',{style:barBg},React.createElement('div',{style:{width:(val/maxInc*100)+'%',height:'100%',background:C.green,borderRadius:4}})),
+            React.createElement('div',{style:{width:80,textAlign:'right',fontWeight:500}},fmt(val))))
+        )
+      ),
+
+      tab==='budget' && React.createElement('div',{className:'fade-in'},
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'Månedligt budget – '+curMonth),
+          React.createElement('div',{style:{fontSize:12,color:C.muted,marginBottom:14}},'Sæt et månedligt loft for hver kategori. Bjælken viser hvor langt du er i denne måned.'),
+          EXP_CATS.map(c=>{
+            const budget=budgets[c]||0;
+            const spent=curMonthCatSpend[c]||0;
+            const pct=budget>0?Math.min(100,spent/budget*100):0;
+            const over=budget>0&&spent>budget;
+            return React.createElement('div',{key:c,style:{marginBottom:14,padding:'10px 12px',background:C.bg,borderRadius:8}},
+              React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6,gap:10,flexWrap:'wrap'}},
+                React.createElement('div',{style:{fontSize:13,fontWeight:500}},c),
+                React.createElement('div',{style:{display:'flex',gap:6,alignItems:'center'}},
+                  React.createElement('span',{style:{fontSize:11,color:C.muted}},'Budget:'),
+                  React.createElement('input',{type:'number',value:budget||'',onChange:e=>{const v=parseFloat(e.target.value)||0;setBudgets({...budgets,[c]:v})},
+                    placeholder:'0',style:{...inp,width:90,padding:'5px 8px',fontSize:12}}))
+              ),
+              budget>0 && React.createElement('div',null,
+                React.createElement('div',{style:{height:6,background:C.border,borderRadius:3,overflow:'hidden'}},
+                  React.createElement('div',{style:{width:pct+'%',height:'100%',background:over?C.red:pct>80?C.amber:C.green}})),
+                React.createElement('div',{style:{display:'flex',justifyContent:'space-between',marginTop:4,fontSize:11,color:C.muted}},
+                  React.createElement('span',null,fmt(spent)+' brugt'),
+                  React.createElement('span',{style:{color:over?C.red:C.muted,fontWeight:over?600:400}},
+                    over?fmt(spent-budget)+' over budget':fmt(budget-spent)+' tilbage')))
+            );
+          })
+        )
+      ),
+
+      tab==='mål' && React.createElement('div',{className:'fade-in'},
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'Sparemål'),
+          goals.length===0 && React.createElement('div',{style:{fontSize:13,color:C.muted,marginBottom:14}},'Ingen mål tilføjet endnu. Sparemålet sammenlignes med din opsparingssaldo.'),
+          goals.map(g=>{
+            const pct=Math.min(100,bal.ops/g.target*100);
+            return React.createElement('div',{key:g.id,style:{marginBottom:14,padding:'12px 14px',background:C.bg,borderRadius:10}},
+              React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}},
+                React.createElement('div',null,
+                  React.createElement('div',{style:{fontSize:14,fontWeight:600}},g.name),
+                  React.createElement('div',{style:{fontSize:12,color:C.muted}},'Mål: '+fmt(g.target))),
+                React.createElement('button',{onClick:()=>setGoals(goals.filter(x=>x.id!==g.id)),style:{...btnSec,padding:'4px 8px',fontSize:11}},'Slet')),
+              React.createElement('div',{style:{height:8,background:C.border,borderRadius:4,overflow:'hidden',marginBottom:6}},
+                React.createElement('div',{style:{width:pct+'%',height:'100%',background:pct>=100?C.green:C.blue}})),
+              React.createElement('div',{style:{display:'flex',justifyContent:'space-between',fontSize:12}},
+                React.createElement('span',{style:{color:C.muted}},pct.toFixed(0)+'% nået'),
+                React.createElement('span',{style:{color:C.text,fontWeight:500}},pct>=100?'🎉 Mål nået!':fmt(g.target-bal.ops)+' tilbage'))
+            );
+          }),
+          React.createElement('div',{style:{borderTop:'1px solid '+C.border,paddingTop:14,marginTop:goals.length>0?6:0}},
+            React.createElement('div',{style:{fontSize:12,fontWeight:600,marginBottom:8}},'Tilføj nyt mål'),
+            React.createElement('div',{style:{display:'flex',gap:8,flexWrap:'wrap'}},
+              React.createElement('input',{value:newGoal.name,onChange:e=>setNewGoal({...newGoal,name:e.target.value}),placeholder:'Navn (fx. Ferie 2027)',style:{...inp,flex:1,minWidth:160}}),
+              React.createElement('input',{value:newGoal.target,onChange:e=>setNewGoal({...newGoal,target:e.target.value}),placeholder:'Beløb',type:'number',style:{...inp,width:120}}),
+              React.createElement('button',{onClick:()=>{
+                if(!newGoal.name||!newGoal.target)return;
+                setGoals([...goals,{id:Date.now(),name:newGoal.name,target:parseFloat(newGoal.target)}]);
+                setNewGoal({name:'',target:''});
+              },style:btnPrim},'Tilføj'))
+          )
+        )
+      ),
+
+      tab==='transaktioner' && React.createElement('div',{className:'fade-in'},
+        React.createElement('div',{style:{...card,padding:'0.85rem 1rem',display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}},
+          React.createElement('div',null,
+            React.createElement('div',{style:{fontSize:11,color:C.muted,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:3}},'Sidst registrerede transaktion'),
+            React.createElement('div',{style:{fontSize:15,fontWeight:600}},overallLast?danishDate(overallLast):'Ingen endnu'),
+            React.createElement('div',{style:{fontSize:12,color:C.muted}},overallLast?relTime(overallLast):'Tilføj din første transaktion')
+          ),
+          React.createElement('button',{onClick:()=>setTab('tilføj'),style:{...btnPrim,padding:'8px 14px'}},'+ Tilføj ny')
+        ),
+        React.createElement('div',{style:{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}},
+          React.createElement('input',{value:search,onChange:e=>setSearch(e.target.value),placeholder:'🔍 Søg...',style:{...inp,flex:1,minWidth:140,fontSize:13,padding:'7px 11px'}}),
+          React.createElement('select',{value:filterMonth,onChange:e=>setFilterMonth(e.target.value),style:{...inp,width:'auto',fontSize:12,padding:'7px 10px'}},
+            React.createElement('option',{value:''},'Alle måneder'),
+            allMonthIds.map(m=>React.createElement('option',{key:m,value:m},m))),
+          React.createElement('select',{value:filterCat,onChange:e=>setFilterCat(e.target.value),style:{...inp,width:'auto',fontSize:12,padding:'7px 10px'}},
+            React.createElement('option',{value:''},'Alle kategorier'),
+            allCatsUsed.map(c=>React.createElement('option',{key:c,value:c},c))),
+          (filterMonth||filterCat||search)&&React.createElement('button',{onClick:()=>{setFilterMonth('');setFilterCat('');setSearch('');},style:btnSec},'Nulstil')
+        ),
+        txs.length===0
+          ? React.createElement('div',{style:{...card,textAlign:'center',padding:'2.5rem 1.5rem',color:C.muted}},
+              React.createElement('div',{style:{fontSize:36,marginBottom:10}},'📋'),
+              React.createElement('div',{style:{fontSize:14}},'Ingen transaktioner tilføjet endnu.'),
+              React.createElement('button',{onClick:()=>setTab('tilføj'),style:{...btnPrim,marginTop:14}},'Tilføj den første →'))
+          : React.createElement('div',null,
+              React.createElement('div',{style:{fontSize:12,color:C.muted,marginBottom:10}},filtered.length+' af '+txs.length+' transaktioner'),
+              filtered.map(tx=>{
+                const isNeutral=NEUTRAL_CATS.has(tx.cat);
+                const isRefusion=tx.cat==='Refusion modtaget';
+                const realExp=Math.abs(tx.amount)-(tx.udlaeg||0);
+                return React.createElement('div',{key:tx.id,style:{...card,display:'flex',alignItems:'center',gap:12,padding:'0.75rem 1rem',marginBottom:8}},
+                  React.createElement('div',{style:{flex:1,minWidth:0}},
+                    React.createElement('div',{style:{fontSize:13,fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},tx.desc),
+                    React.createElement('div',{style:{fontSize:11,color:C.muted,marginTop:2}},
+                      danishDate(tx.date)+' · '+tx.cat+
+                      (isRefusion?(tx.linkedCat?' → ↓ '+tx.linkedCat:' → ↓ generelt'):isNeutral?' (neutral)':'')+
+                      (tx.udlaeg?' · 🤝 '+fmt(tx.udlaeg)+' lagt ud':''))),
+                  React.createElement('div',{style:{textAlign:'right',flexShrink:0}},
+                    React.createElement('div',{style:{fontSize:14,fontWeight:600,color:isNeutral?C.amber:tx.amount>=0?C.green:C.red}},
+                      (tx.amount>=0?'+':'')+fmt(tx.amount)),
+                    tx.udlaeg>0 && React.createElement('div',{style:{fontSize:10,color:C.muted,marginTop:2}},
+                      'reelt: '+fmt(realExp))),
+                  React.createElement('button',{onClick:()=>delTx(tx.id),style:{...btnSec,padding:'4px 9px',fontSize:11}},'Slet'));
+              }))
+      ),
+
+      tab==='tilføj' && React.createElement('div',{className:'fade-in'},
+        templates.length>0 && React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'⚡ Hurtig-tilføj'),
+          React.createElement('div',{style:{display:'flex',gap:8,flexWrap:'wrap'}},
+            templates.map(t=>React.createElement('button',{key:t.id,onClick:()=>applyTemplate(t),
+              style:{padding:'8px 14px',borderRadius:8,background:C.bg,border:'1px solid '+C.border,cursor:'pointer',fontSize:13,color:C.text,display:'flex',alignItems:'center',gap:6}},
+              React.createElement('span',{style:{fontWeight:600}},t.name),
+              React.createElement('span',{style:{color:C.muted,fontSize:11}},fmt(t.amount)))))
+        ),
+        fixed.length>0 && React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10,flexWrap:'wrap',gap:8}},
+            React.createElement('div',null,
+              React.createElement('div',{style:{fontSize:11,fontWeight:600,color:C.muted,textTransform:'uppercase',letterSpacing:'0.07em'}},'📅 Faste udgifter'),
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginTop:2}},'Total: '+fmt(fixed.reduce((s,f)=>s+f.amount,0))+'/md')),
+            React.createElement('button',{onClick:triggerFixed,style:btnPrim},'Træk denne måneds')),
+          React.createElement('div',{style:{fontSize:11,color:C.muted}},fixed.map(f=>f.name).join(' · '))
+        ),
+        React.createElement('div',{style:{...card,maxWidth:520}},
+          React.createElement('div',{style:secTitle},'Ny transaktion'),
+          // Type toggle
+          React.createElement('div',{style:{display:'flex',gap:6,marginBottom:14,padding:4,background:C.bg,borderRadius:10}},
+            ...[
+              {id:'expense',label:'↓ Udgift',c:C.red,bg:C.rbg},
+              {id:'income',label:'↑ Indtægt',c:C.green,bg:C.gbg},
+              {id:'neutral',label:'↔ Refusion / opsparing',c:C.amber,bg:C.abg},
+            ].map(t=>React.createElement('button',{key:t.id,onClick:()=>setFormType(t.id),
+              style:{flex:1,padding:'8px 10px',borderRadius:7,border:'none',cursor:'pointer',fontSize:12,fontWeight:600,
+                background:form.type===t.id?t.bg:'transparent',
+                color:form.type===t.id?t.c:C.muted}},t.label))
+          ),
+          React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:14}},
+            React.createElement('div',null,
+              React.createElement('label',{style:inpLabel},'Dato'),
+              React.createElement('input',{type:'date',value:form.date,onChange:e=>setForm({...form,date:e.target.value}),style:inp})),
+            React.createElement('div',null,
+              React.createElement('label',{style:inpLabel},form.type==='expense'?'Beskrivelse (kategori vælges automatisk)':'Beskrivelse'),
+              React.createElement('input',{value:form.desc,onChange:e=>setForm({...form,desc:e.target.value}),
+                placeholder:form.type==='expense'?'fx. Netto, OK tankning...':form.type==='income'?'fx. Løn maj, MobilePay fra Lars...':'fx. Refusion fra kæreste...',style:inp})),
+            React.createElement('div',null,
+              React.createElement('label',{style:inpLabel},'Beløb (kr)'),
+              React.createElement('input',{value:form.amount,onChange:e=>setForm({...form,amount:e.target.value}),placeholder:'fx. 350',type:'text',style:inp})),
+            // Optional udlaeg field - only shown for expenses
+            form.type==='expense' && React.createElement('div',null,
+              React.createElement('label',{style:inpLabel},'🤝 Heraf lagt ud for andre (valgfri)'),
+              React.createElement('input',{value:form.udlaeg,onChange:e=>setForm({...form,udlaeg:e.target.value}),
+                placeholder:'fx. 200 (hvis halvdelen tilbagebetales)',type:'text',style:inp}),
+              form.udlaeg && form.amount && React.createElement('div',{style:{fontSize:11,color:C.muted,marginTop:5}},
+                '→ Din reelle udgift: ',React.createElement('b',{style:{color:C.text}},
+                  fmt(Math.max(0,Math.abs(parseFloat(form.amount.replace(',','.'))||0)-Math.abs(parseFloat(form.udlaeg.replace(',','.'))||0)))),
+                ' (resten venter på refusion — registrér den som "Refusion modtaget" når den kommer)')
+            ),
+            React.createElement('div',null,
+              React.createElement('label',{style:inpLabel},'Kategori'),
+              React.createElement('select',{value:form.cat,onChange:e=>setForm({...form,cat:e.target.value,linkedCat:''}),style:inp},
+                (form.type==='income'?INC_CATS_LIST:form.type==='neutral'?NEUTRAL_CATS_LIST:EXP_CATS).map(c=>React.createElement('option',{key:c,value:c},c)))),
+            // linkedCat dropdown when category is Refusion modtaget
+            form.cat==='Refusion modtaget' && React.createElement('div',null,
+              React.createElement('label',{style:inpLabel},'↓ Reducerer udgifter i kategori (valgfri)'),
+              React.createElement('select',{value:form.linkedCat,onChange:e=>setForm({...form,linkedCat:e.target.value}),style:inp},
+                React.createElement('option',{value:''},'(Generelt – reducerer total udgifter)'),
+                EXP_CATS.map(c=>React.createElement('option',{key:c,value:c},c))),
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginTop:5}},
+                form.linkedCat?'Refusionen vil reducere "'+form.linkedCat+'" med beløbet':'Refusionen reducerer dine samlede udgifter, men ikke en specifik kategori')
+            ),
+            React.createElement('div',{style:{padding:'10px 12px',background:catHint.bg,borderRadius:8,fontSize:12,color:catHint.c,fontWeight:500}},catHint.text),
+            React.createElement('button',{onClick:submitForm,style:{...btnPrim,padding:'12px',fontSize:14,background:saved?C.green:C.text}},
+              saved?'✓ Gemt!':'Tilføj transaktion'))
+        )
+      ),
+
+      tab==='indstillinger' && React.createElement('div',{className:'fade-in'},
+        importMsg && React.createElement('div',{style:{...card,background:importMsg.ok?C.gbg:C.rbg,borderColor:importMsg.ok?C.green:C.red,color:importMsg.ok?C.green:C.red,fontWeight:500,fontSize:13}},importMsg.text),
+
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'💼 Forventet månedsløn'),
+          React.createElement('div',{style:{fontSize:12,color:C.muted,marginBottom:12}},'Bruges i prognosen til at beregne forventet indtægt. Sæt det til din normale månedsløn.'),
+          React.createElement('div',{style:{display:'flex',gap:8,alignItems:'center'}},
+            React.createElement('input',{type:'number',value:tmpSalary||expectedSalary,onChange:e=>setTmpSalary(e.target.value),
+              style:{...inp,width:160}}),
+            React.createElement('span',{style:{fontSize:13,color:C.muted}},'kr/md'),
+            React.createElement('button',{onClick:()=>{
+              const v=parseFloat(tmpSalary);
+              if(!isNaN(v)&&v>0){setExpectedSalary(Math.round(v));setTmpSalary('');setImportMsg({ok:true,text:'Forventet løn opdateret'});setTimeout(()=>setImportMsg(null),2000);}
+            },style:btnPrim},'Gem'))
+        ),
+
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'💾 Backup & gendannelse'),
+          React.createElement('div',{style:{fontSize:12,color:C.muted,marginBottom:14}},'Gem en JSON-fil med alle dine data, eller gendan fra en tidligere backup. Kan også flyttes mellem enheder.'),
+          React.createElement('div',{style:{display:'flex',gap:8,flexWrap:'wrap'}},
+            React.createElement('button',{onClick:exportJSON,style:btnPrim},'Download JSON-backup'),
+            React.createElement('button',{onClick:exportCSV,style:{...btnPrim,background:C.blue,color:'#fff'}},'Eksporter CSV'),
+            React.createElement('label',{style:{...btnSec,padding:'10px 16px',fontSize:13,fontWeight:600,cursor:'pointer'}},
+              'Gendan fra JSON',
+              React.createElement('input',{type:'file',accept:'.json',onChange:importJSON,style:{display:'none'}})))
+        ),
+
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'📥 Massimport fra bank-CSV'),
+          !importPreview && React.createElement('div',null,
+            React.createElement('div',{style:{fontSize:12,color:C.muted,marginBottom:12}},
+              'Importer transaktioner fra dit bank-eksport. Du får en forhåndsvisning hvor du kan rette type, kategori og udlæg før noget gemmes. Dubletter ekskluderes automatisk.'),
+            React.createElement('div',{style:{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}},
+              React.createElement('label',{style:{...btnPrim,padding:'10px 16px',cursor:'pointer',display:'inline-flex',alignItems:'center',gap:6}},
+                '📂 Vælg CSV-fil',
+                React.createElement('input',{type:'file',accept:'.csv,.txt',onChange:importCSVFile,style:{display:'none'}})),
+              React.createElement('span',{style:{fontSize:12,color:C.muted,alignSelf:'center'}},'eller indsæt rækker manuelt nedenfor:')
+            ),
+            React.createElement('textarea',{value:pasteText,onChange:e=>setPasteText(e.target.value),
+              placeholder:'2026/05/12;-250,00;Netto\n2026/05/13;-99,00;Spotify\n2026/05/14;200,00;MobilePay fra kæreste',
+              rows:5,style:{...inp,fontFamily:'monospace',fontSize:12,resize:'vertical',minHeight:90}}),
+            React.createElement('button',{onClick:parseImport,style:{...btnPrim,marginTop:10}},'Forhåndsvis →')
+          ),
+          importPreview && (function(){
+            const items=importPreview.items;
+            const includedCount=items.filter(it=>it.included).length;
+            const dupCount=items.filter(it=>it.isDuplicate).length;
+            const dupIncluded=items.filter(it=>it.isDuplicate&&it.included).length;
+            const incomingMP=items.filter(it=>it.amount>0&&it.type==='income'&&(it.desc.toLowerCase().includes('mobilepay')||it.cat==='MobilePay modtaget')).length;
+            const totalInc=items.filter(it=>it.included&&it.type==='income').reduce((s,it)=>s+Math.abs(it.amount),0);
+            const totalExp=items.filter(it=>it.included&&it.type==='expense').reduce((s,it)=>s+(Math.abs(it.amount)-(parseFloat(it.udlaeg)||0)),0);
+            const totalNeu=items.filter(it=>it.included&&it.type==='neutral').length;
+            return React.createElement('div',null,
+              React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10,flexWrap:'wrap',gap:8}},
+                React.createElement('div',{style:{fontSize:13,fontWeight:600}},'Forhåndsvisning: '+includedCount+' transaktioner'+(dupCount>0?' ('+dupCount+' dubletter fundet)':'')),
+                React.createElement('div',{style:{display:'flex',gap:6}},
+                  React.createElement('button',{onClick:cancelImport,style:btnSec},'Annuller'),
+                  React.createElement('button',{onClick:confirmImport,style:btnPrim},'✓ Importér '+includedCount))
+              ),
+              // Summary stats
+              React.createElement('div',{style:{display:'flex',gap:8,fontSize:11,marginBottom:10,flexWrap:'wrap'}},
+                React.createElement('span',{style:{padding:'4px 10px',background:C.gbg,color:C.green,borderRadius:14,fontWeight:500}},'↑ '+fmt(totalInc)+' indt.'),
+                React.createElement('span',{style:{padding:'4px 10px',background:C.rbg,color:C.red,borderRadius:14,fontWeight:500}},'↓ '+fmt(totalExp)+' udg.'),
+                totalNeu>0 && React.createElement('span',{style:{padding:'4px 10px',background:C.abg,color:C.amber,borderRadius:14,fontWeight:500}},'↔ '+totalNeu+' neutrale')
+              ),
+              // Duplicate alert
+              dupCount>0 && React.createElement('div',{style:{padding:'9px 12px',background:C.abg,borderRadius:8,fontSize:12,marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}},
+                React.createElement('span',{style:{color:C.amber}},'🔁 '+dupCount+' dublet'+(dupCount===1?'':'ter')+' fundet i dine eksisterende transaktioner — '+(dupIncluded===0?'ekskluderet automatisk':dupIncluded+' inkluderet')),
+                React.createElement('div',{style:{display:'flex',gap:6}},
+                  dupIncluded>0 && React.createElement('button',{onClick:()=>bulkToggleDuplicates(false),style:{...btnSec,fontSize:11,padding:'5px 10px',color:C.amber,borderColor:C.amber}},'Ekskludér alle'),
+                  dupIncluded<dupCount && React.createElement('button',{onClick:()=>bulkToggleDuplicates(true),style:{...btnSec,fontSize:11,padding:'5px 10px',color:C.amber,borderColor:C.amber}},'Inkludér alle alligevel'))
+              ),
+              // Bulk MobilePay refusion
+              incomingMP>0 && React.createElement('div',{style:{padding:'9px 12px',background:C.bbg,borderRadius:8,fontSize:12,marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}},
+                React.createElement('span',{style:{color:C.blue}},'💡 '+incomingMP+' indkomne MobilePay – er nogle refusioner fra venner/familie?'),
+                React.createElement('button',{onClick:bulkMarkIncomingAsRefusion,style:{...btnSec,fontSize:11,padding:'5px 10px',color:C.blue,borderColor:C.blue}},'Marker alle som refusion')
+              ),
+              React.createElement('div',{style:{fontSize:11,color:C.muted,marginBottom:8}},
+                '👇 Tjek hver række. Klik på ↓↑↔ for at skifte type. Tilføj udlæg på delte regninger. Slet linjer du ikke vil importere. ',
+                React.createElement('b',null,'NB:'),' Lønkonto-saldoen opdateres automatisk efter import — juster den manuelt bagefter hvis nødvendigt.'),
+              // Item list
+              React.createElement('div',{style:{maxHeight:400,overflowY:'auto',border:'1px solid '+C.border,borderRadius:8,padding:6}},
+                items.map((it,idx)=>React.createElement('div',{key:idx,style:{padding:'8px 10px',borderRadius:6,marginBottom:4,background:it.included?(it.isDuplicate?C.abg:C.bg):'transparent',opacity:it.included?1:0.4,border:it.isDuplicate?'1px solid '+C.amber:'none'}},
+                  // Top line: date, desc, amount, delete
+                  React.createElement('div',{style:{display:'flex',gap:8,alignItems:'center',marginBottom:6,fontSize:12,flexWrap:'wrap'}},
+                    React.createElement('span',{style:{color:C.muted,fontFamily:'monospace',fontSize:11,minWidth:65}},danishDate(it.date)),
+                    React.createElement('span',{style:{flex:1,minWidth:120,fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},it.desc),
+                    it.isDuplicate && React.createElement('span',{title:'Findes allerede med samme dato, beløb og beskrivelse',style:{padding:'2px 7px',background:C.amber,color:'#fff',fontSize:10,borderRadius:10,fontWeight:600,whiteSpace:'nowrap'}},'🔁 Dublet'),
+                    React.createElement('span',{style:{fontWeight:600,color:it.type==='neutral'?C.amber:it.amount>=0?C.green:C.red,minWidth:70,textAlign:'right'}},(it.amount>=0?'+':'')+fmt(it.amount)),
+                    React.createElement('button',{onClick:()=>updatePreviewItem(idx,{included:!it.included}),style:{...btnSec,padding:'3px 8px',fontSize:10,minWidth:55}},it.included?'✕ Skip':'+ Inkl')
+                  ),
+                  // Bottom line: type toggle, category, udlæg / linkedCat
+                  it.included && React.createElement('div',{style:{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}},
+                    React.createElement('div',{style:{display:'flex',gap:2,padding:2,background:C.card,borderRadius:6}},
+                      ...[
+                        {id:'expense',icon:'↓',c:C.red},
+                        {id:'income',icon:'↑',c:C.green},
+                        {id:'neutral',icon:'↔',c:C.amber},
+                      ].map(t=>React.createElement('button',{key:t.id,onClick:()=>setPreviewType(idx,t.id),
+                        title:t.id,
+                        style:{padding:'3px 8px',borderRadius:4,border:'none',cursor:'pointer',fontSize:11,fontWeight:600,
+                          background:it.type===t.id?t.c:'transparent',color:it.type===t.id?'#fff':C.muted}},t.icon))
+                    ),
+                    React.createElement('select',{value:it.cat,onChange:e=>updatePreviewItem(idx,{cat:e.target.value,linkedCat:''}),
+                      style:{...inp,padding:'4px 8px',fontSize:11,width:'auto',flex:1,minWidth:120}},
+                      (it.type==='income'?INC_CATS_LIST:it.type==='neutral'?NEUTRAL_CATS_LIST:EXP_CATS).map(c=>React.createElement('option',{key:c,value:c},c))),
+                    it.type==='expense' && React.createElement('input',{type:'text',value:it.udlaeg,onChange:e=>updatePreviewItem(idx,{udlaeg:e.target.value}),
+                      placeholder:'🤝 udlæg',
+                      style:{...inp,padding:'4px 8px',fontSize:11,width:80}}),
+                    it.cat==='Refusion modtaget' && React.createElement('select',{value:it.linkedCat||'',onChange:e=>updatePreviewItem(idx,{linkedCat:e.target.value}),
+                      title:'Reducerer udgifter i denne kategori',
+                      style:{...inp,padding:'4px 8px',fontSize:11,width:'auto',minWidth:130}},
+                      React.createElement('option',{value:''},'↓ generelt'),
+                      EXP_CATS.map(c=>React.createElement('option',{key:c,value:c},'↓ '+c)))
+                  )
+                ))
+              )
+            );
+          })()
+        ),
+
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'📅 Faste månedlige udgifter'),
+          fixed.map(f=>React.createElement('div',{key:f.id,style:{display:'flex',gap:8,alignItems:'center',padding:'8px 10px',background:C.bg,borderRadius:8,marginBottom:6}},
+            React.createElement('div',{style:{flex:1,fontSize:13}},
+              React.createElement('div',{style:{fontWeight:500}},f.name),
+              React.createElement('div',{style:{fontSize:11,color:C.muted}},f.cat)),
+            React.createElement('div',{style:{fontSize:13,fontWeight:500,color:C.red}},fmt(f.amount)),
+            React.createElement('button',{onClick:()=>setFixed(fixed.filter(x=>x.id!==f.id)),style:{...btnSec,padding:'4px 8px',fontSize:11}},'Slet'))),
+          React.createElement('div',{style:{borderTop:'1px solid '+C.border,paddingTop:12,marginTop:8}},
+            React.createElement('div',{style:{display:'flex',gap:6,flexWrap:'wrap'}},
+              React.createElement('input',{value:newFixed.name,onChange:e=>setNewFixed({...newFixed,name:e.target.value}),placeholder:'Navn',style:{...inp,flex:1,minWidth:120}}),
+              React.createElement('input',{value:newFixed.amount,onChange:e=>setNewFixed({...newFixed,amount:e.target.value}),placeholder:'Beløb',type:'number',style:{...inp,width:90}}),
+              React.createElement('select',{value:newFixed.cat,onChange:e=>setNewFixed({...newFixed,cat:e.target.value}),style:{...inp,width:140}},
+                EXP_CATS.map(c=>React.createElement('option',{key:c,value:c},c))),
+              React.createElement('button',{onClick:()=>{
+                if(!newFixed.name||!newFixed.amount)return;
+                setFixed([...fixed,{id:Date.now(),name:newFixed.name,amount:parseFloat(newFixed.amount),cat:newFixed.cat}]);
+                setNewFixed({name:'',amount:'',cat:'Dagligvarer'});
+              },style:btnPrim},'+'))
+          )
+        ),
+
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'⚡ Hurtig-tilføj skabeloner'),
+          templates.map(t=>React.createElement('div',{key:t.id,style:{display:'flex',gap:8,alignItems:'center',padding:'8px 10px',background:C.bg,borderRadius:8,marginBottom:6}},
+            React.createElement('div',{style:{flex:1,fontSize:13}},
+              React.createElement('div',{style:{fontWeight:500}},t.name),
+              React.createElement('div',{style:{fontSize:11,color:C.muted}},t.desc+' · '+t.cat)),
+            React.createElement('div',{style:{fontSize:13,fontWeight:500}},fmt(t.amount)),
+            React.createElement('button',{onClick:()=>setTemplates(templates.filter(x=>x.id!==t.id)),style:{...btnSec,padding:'4px 8px',fontSize:11}},'Slet'))),
+          React.createElement('div',{style:{borderTop:'1px solid '+C.border,paddingTop:12,marginTop:8}},
+            React.createElement('div',{style:{display:'flex',gap:6,flexWrap:'wrap'}},
+              React.createElement('input',{value:newTemplate.name,onChange:e=>setNewTemplate({...newTemplate,name:e.target.value}),placeholder:'Knap-navn',style:{...inp,flex:1,minWidth:100}}),
+              React.createElement('input',{value:newTemplate.desc,onChange:e=>setNewTemplate({...newTemplate,desc:e.target.value}),placeholder:'Beskrivelse',style:{...inp,flex:1,minWidth:120}}),
+              React.createElement('input',{value:newTemplate.amount,onChange:e=>setNewTemplate({...newTemplate,amount:e.target.value}),placeholder:'Beløb',type:'number',style:{...inp,width:80}}),
+              React.createElement('select',{value:newTemplate.cat,onChange:e=>setNewTemplate({...newTemplate,cat:e.target.value}),style:{...inp,width:140}},
+                ALL_CATS.map(c=>React.createElement('option',{key:c,value:c},c))),
+              React.createElement('button',{onClick:()=>{
+                if(!newTemplate.name||!newTemplate.amount||!newTemplate.desc)return;
+                setTemplates([...templates,{id:Date.now(),...newTemplate,amount:parseFloat(newTemplate.amount)}]);
+                setNewTemplate({name:'',amount:'',cat:'Dagligvarer',desc:''});
+              },style:btnPrim},'+'))
+          )
+        ),
+
+        React.createElement('div',{style:{...card}},
+          React.createElement('div',{style:secTitle},'⚠ Fareland'),
+          React.createElement('button',{onClick:resetAll,style:{...btnPrim,background:C.red,color:'#fff'}},'Nulstil alle data')
+        )
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+
+// Registrér service worker for PWA-funktionalitet (offline + installerbar)
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js')
+      .then(reg => console.log('SW registered:', reg.scope))
+      .catch(err => console.log('SW registration failed:', err));
+  });
+}
+</script>
+</body>
+</html>
